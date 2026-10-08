@@ -2959,7 +2959,12 @@ class RoutedMoE(nnx.Module):
         original_inputs_first_dim = batch_size * sequence_length * self.config.num_experts_per_tok
         if routing.sorted_selected_experts.shape[0] != original_inputs_first_dim:
           raise ValueError("original_inputs_first_dim does not match the original tensor" " shape!")
-        output_shape = jax.lax.empty(
+        # The return all-to-all only writes the rows of tokens the receiving shard kept. When a capped ragged
+        # buffer (ragged_buffer_factor > 0) overflows, the dropped (token, expert) rows are never written, and an
+        # uninitialized buffer feeds whatever memory held into unpermute: NaN loss instead of a dropped token.
+        # Zeros make the drop a drop. The dropless buffer writes every row, so it keeps the cheaper empty buffer.
+        make_buffer = jnp.zeros if self.get_ragged_buffer_factor() > 0.0 else jax.lax.empty
+        output_shape = make_buffer(
             (
                 original_inputs_first_dim,
                 self.moe_expert_input_dim // self.get_tensor_parallelism_size(),
