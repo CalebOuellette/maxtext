@@ -311,8 +311,59 @@ def _kernel_l2norm(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
   return (x_f * jax.lax.rsqrt(jnp.sum(x_f * x_f, axis=-1, keepdims=True) + eps)).astype(x.dtype)
 
 
-def _l2_normalize(x: jnp.ndarray, eps: float = 1e-12) -> jnp.ndarray:
-  return x * jax.lax.rsqrt(jnp.maximum(jnp.sum(x * x, axis=-1, keepdims=True), eps))
+def _l2_normalize(x: jnp.ndarray, eps: float = 1e-6) -> jnp.ndarray:
+  """The q/k L2-norm of the unfused path: FLA's ``l2norm`` (rsqrt(sum + 1e-6)), like the fused kernel's.
+
+  It used to be rsqrt(max(sum, 1e-12)), the standalone reference's form. On real OLMo-core weights that
+  epsilon alone put the KDA layers 8e-4 off the PyTorch/FLA model's logits; with FLA's it is 7e-5.
+  """
+  return _kernel_l2norm(x, eps)
+
+
+def _diagonal_blocks(m: jnp.ndarray, size: int) -> jnp.ndarray:
+  """The ``size x size`` blocks on the diagonal of ``[..., n, n]``, as ``[..., n // size, size, size]``."""
+  n = m.shape[-1]
+  blocks = m.reshape(*m.shape[:-2], n // size, size, n // size, size)
+  return jnp.moveaxis(jnp.diagonal(blocks, axis1=-4, axis2=-2), -1, -3)
+
+
+def _inverse_unit_lower(m: jnp.ndarray, block: int = 16) -> jnp.ndarray:
+  """``(I + M)^-1`` for strictly lower-triangular ``M`` of shape ``[..., c, c]``.
+
+  Forward substitution inside ``block``-sized diagonal blocks, then block elimination doubling the block up to
+  ``c`` (``[[A, 0], [B, C]]^-1 = [[A^-1, 0], [-C^-1 B A^-1, C^-1]]``), which is how FLA's ``solve_tril`` does it.
+  Every intermediate is a diagonal block of the result, so nothing grows past the answer, and the sequential
+  depth is ``block`` row updates plus ``log2(c / block)`` batched matmuls.
+
+  This replaced a Newton-Schulz iteration (``X <- X(2I - AX)`` from ``X = I - M``), which is exact in log2(c)
+  steps because M is nilpotent, but whose iterates are the Neumann partial sums ``sum_i (-M)^i``. For the delta
+  rule M is ``beta_i * k_i . k_j`` (decayed), and on real keys, which are far more alike than random ones, with
+  beta up to 2, those partial sums reach 1e8..1e20 in fp32 before they cancel. The inverse came back wrong by
+  orders of magnitude while still finite, or as inf once a product overflowed, which is where the chunked rule's
+  loss drift on trained weights and the NaN steps in training came from.
+  """
+  c = m.shape[-1]
+  blocks = c // block if block < c else 1
+  if c % block or blocks & (blocks - 1):
+    block, blocks = c, 1
+  eye = jnp.eye(block, dtype=m.dtype)
+  diag = _diagonal_blocks(m, block)  # [..., blocks, block, block]
+  # Row i of (I + D)^-1 is e_i - sum_{j < i} D[i, j] row_j.
+  rows = [jnp.broadcast_to(eye[0], diag.shape[:-2] + (block,))]
+  for i in range(1, block):
+    prev = jnp.stack(rows, axis=-2)
+    rows.append(eye[i] - jnp.einsum("...j,...jk->...k", diag[..., i, :i], prev))
+  inv = jnp.stack(rows, axis=-2)
+  size = block
+  while size < c:
+    a_inv, c_inv = inv[..., 0::2, :, :], inv[..., 1::2, :, :]
+    b = _diagonal_blocks(m, 2 * size)[..., size:, :size]
+    lower_left = -jnp.einsum("...ij,...jk,...kl->...il", c_inv, b, a_inv)
+    top = jnp.concatenate([a_inv, jnp.zeros_like(a_inv)], axis=-1)
+    bottom = jnp.concatenate([lower_left, c_inv], axis=-1)
+    inv = jnp.concatenate([top, bottom], axis=-2)
+    size *= 2
+  return inv[..., 0, :, :]
 
 
 def _delta_rule_chunked(q, k, v, log_decay, beta, resets, chunk_size: int, state_dtype: str = "float32") -> jnp.ndarray:
@@ -353,7 +404,6 @@ def _delta_rule_chunked(q, k, v, log_decay, beta, resets, chunk_size: int, state
   beta_c = beta.reshape(batch, num_chunks, c, heads).transpose(1, 0, 3, 2)
   reset_c = resets.reshape(batch, num_chunks, c).transpose(1, 0, 2)
 
-  eye = jnp.eye(c, dtype=q.dtype)
   causal = jnp.tril(jnp.ones((c, c), dtype=bool))
   strict = jnp.tril(jnp.ones((c, c), dtype=bool), k=-1)
   positions = jnp.arange(c)
@@ -392,13 +442,9 @@ def _delta_rule_chunked(q, k, v, log_decay, beta, resets, chunk_size: int, state
     # (I + diag(beta) M) delta = diag(beta) (v - carried prediction)
     m = jnp.einsum("bhid,bhjd,bhijd->bhij", k_i, k_i, pair_decay)
     m = jnp.where(strict & same_doc, m, 0.0) * beta_i[..., None]
-    # (I + M)^-1 via Newton (X <- X(2I - AX)); M nilpotent so it converges in
-    # log2(C) steps. Batched matmuls stay on the MXU; solve_triangular's TPU
-    # lowering forced a ~2.4s/step relayout at the 3p5b shape (profiled).
-    a_mat = eye + m
-    m_inv = eye - m
-    for _ in range(max(0, (c - 1).bit_length() - 1)):
-      m_inv = m_inv @ (2.0 * eye - a_mat @ m_inv)
+    # (I + M)^-1 by blocked forward substitution, in fp32. Not Newton (see _inverse_unit_lower), and not
+    # solve_triangular, whose TPU lowering forced a ~2.4s/step relayout at the 3p5b shape (profiled).
+    m_inv = _inverse_unit_lower(m.astype(jnp.float32))
     carried = jnp.einsum("bhid,bhdv->bhiv", k_i * cum.astype(compute_dtype), state) * from_prev
     delta = jnp.einsum(
         "bhij,bhjv->bhiv", m_inv.astype(compute_dtype), (v_i - carried) * beta_i[..., None].astype(compute_dtype)

@@ -472,11 +472,10 @@ class OLMoE3TokamaxKDATest(unittest.TestCase):
     expected = self._layer_out(False, x, segment_ids)
     actual = self._layer_out(True, x, segment_ids)
     rel = jnp.max(jnp.abs(actual - expected)) / jnp.max(jnp.abs(expected))
-    # The only known semantic difference is the q/k L2-norm epsilon: tokamax
-    # (like FLA's production kernel, which is what AI2 trains with) uses
-    # rsqrt(sum + 1e-6); the unfused path matches the standalone reference's
-    # max(sum, 1e-12). That contributes ~5e-4; anything past 2e-3 means the
-    # argument mapping broke.
+    # Both paths now use FLA's q/k L2-norm (rsqrt(sum + 1e-6), what AI2 trains
+    # with); the unfused path used to take the standalone reference's
+    # max(sum, 1e-12), worth ~5e-4 here. Anything past 2e-3 means the argument
+    # mapping broke.
     self.assertLess(float(rel), 2e-3, f"tokamax KDA relative error {rel:.2e}")
 
   def test_matches_unfused_at_large_decay(self):
@@ -593,32 +592,67 @@ class OLMoE3ChunkedDeltaRuleTest(unittest.TestCase):
     rel = jnp.max(jnp.abs(actual - expected)) / jnp.max(jnp.abs(expected))
     self.assertLess(float(rel), 2e-5, f"rel err {rel:.2e}")
 
-  def test_newton_inversion_matches_solve_triangular(self):
-    """The log-depth Newton inversion must equal the triangular solve it replaced.
+  @staticmethod
+  def _system_matrix(key, c, batch=2, heads=3, dk=128, key_spread=1.0, beta_max=2.0):
+    """``M`` of the chunk system ``(I + M) delta = ...``: strictly lower ``beta_i k_i . k_j`` on unit keys.
 
-    The delta rule's system matrix is I + M with M strictly lower triangular
-    (nilpotent), so Newton is exact in ceil(log2(C))-1 iterations. This pins the
-    substitution directly, at the model's beta range [0, 2) and unit-norm keys.
+    ``key_spread`` is the noise around a shared direction, so keys get more alike as it shrinks; random keys
+    (``inf``) are the easy case, trained keys sit well below 1.
     """
+    k1, k2, k3 = jax.random.split(key, 3)
+    base = jax.random.normal(k1, (batch, heads, 1, dk))
+    noise = jax.random.normal(k2, (batch, heads, c, dk))
+    k_vecs = noise if key_spread == float("inf") else base + key_spread * noise
+    k_vecs /= jnp.linalg.norm(k_vecs, axis=-1, keepdims=True)
+    beta = beta_max * jax.nn.sigmoid(jax.random.normal(k3, (batch, heads, c)))
+    m = jnp.einsum("bhid,bhjd->bhij", k_vecs, k_vecs)
+    return jnp.where(jnp.tril(jnp.ones((c, c), bool), k=-1), m, 0.0) * beta[..., None]
+
+  def test_unit_lower_inverse_matches_solve_triangular(self):
+    """The blocked forward substitution equals the triangular solve, on random and on near-collinear keys.
+
+    The Newton-Schulz iteration it replaced passes on random keys and fails the rest: its iterates (the
+    Neumann partial sums of -M) reach 1e8..1e20 in fp32 before cancelling, so at key_spread 0.3 its inverse
+    is off by 1e4x and worse. Trained keys are that alike, which is what drove the chunked rule's loss drift
+    and the NaN steps.
+    """
+    # pylint: disable=import-outside-toplevel
+    from maxtext.models import olmoe3
+
     key = jax.random.PRNGKey(0)
     for c in (16, 32, 64):
-      key, k1, k2 = jax.random.split(key, 3)
-      batch, heads, dk = 2, 3, 32
-      k_vecs = jax.random.normal(k1, (batch, heads, c, dk))
-      k_vecs /= jnp.linalg.norm(k_vecs, axis=-1, keepdims=True)
-      beta = 2.0 * jax.nn.sigmoid(jax.random.normal(k2, (batch, heads, c)))
-      m = jnp.einsum("bhid,bhjd->bhij", k_vecs, k_vecs)
-      m = jnp.where(jnp.tril(jnp.ones((c, c), bool), k=-1), m, 0.0) * beta[..., None]
-      eye = jnp.eye(c)
-      reference = jax.scipy.linalg.solve_triangular(
-          eye + m, jnp.broadcast_to(eye, m.shape), lower=True, unit_diagonal=True
+      for key_spread in (float("inf"), 1.0, 0.3, 0.03):
+        key, sub = jax.random.split(key)
+        m = self._system_matrix(sub, c, key_spread=key_spread)
+        eye = jnp.eye(c)
+        reference = jax.scipy.linalg.solve_triangular(
+            eye + m, jnp.broadcast_to(eye, m.shape), lower=True, unit_diagonal=True
+        )
+        actual = olmoe3._inverse_unit_lower(m)  # pylint: disable=protected-access
+        self.assertTrue(bool(jnp.isfinite(actual).all()), f"c={c} spread={key_spread}: non-finite inverse")
+        rel = jnp.max(jnp.abs(actual - reference)) / jnp.max(jnp.abs(reference))
+        self.assertLess(float(rel), 1e-5, f"c={c} spread={key_spread}: inverse rel err {rel:.2e}")
+
+  def test_matches_scan_with_correlated_keys(self):
+    """The chunked rule on keys as alike as a trained model's, where the Newton inverse was wrong by 1e4x.
+
+    Unit keys around one shared direction (spread 0.3 and 0.03), beta in [0, 2), decay near 1 so nothing
+    damps the chunk system. The scan has no such inverse and is the reference.
+    """
+    olmoe3, (q, _, v, _, beta, resets) = self._inputs(128, dk=128)
+    for key_spread in (0.3, 0.03):
+      k1, k2 = jax.random.split(jax.random.PRNGKey(11), 2)
+      base = jax.random.normal(k1, (q.shape[0], 1, q.shape[2], q.shape[3]))
+      k = base + key_spread * jax.random.normal(k2, q.shape)
+      k /= jnp.linalg.norm(k, axis=-1, keepdims=True)
+      decay = jnp.full(q.shape, 0.98, jnp.float32)
+      expected = olmoe3._delta_rule_scan(q, k, v, decay, beta, resets)  # pylint: disable=protected-access
+      actual = olmoe3._delta_rule_chunked(  # pylint: disable=protected-access
+          q, k, v, jnp.log(decay), beta, resets, 64, "float32"
       )
-      a_mat = eye + m
-      x = eye - m
-      for _ in range(max(0, (c - 1).bit_length() - 1)):
-        x = x @ (2.0 * eye - a_mat @ x)
-      rel = jnp.max(jnp.abs(x - reference)) / jnp.max(jnp.abs(reference))
-      self.assertLess(float(rel), 1e-5, f"c={c}: Newton inverse rel err {rel:.2e}")
+      self.assertTrue(bool(jnp.isfinite(actual).all()), f"spread={key_spread}: chunked rule returned non-finite")
+      rel = jnp.max(jnp.abs(actual - expected)) / jnp.max(jnp.abs(expected))
+      self.assertLess(float(rel), 2e-5, f"spread={key_spread}: rel err {rel:.2e}")
 
   def test_gradients_finite_and_match_scan(self):
     """Backward through the chunked rule, at reference-scale decay with a mid-chunk reset.
