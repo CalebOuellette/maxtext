@@ -494,7 +494,19 @@ class ShiftToInputsTargets(grain.transforms.Map):
   The OLMo dataset has no document boundaries inside an instance — sequences
   span doc boundaries with no special masking — so ``segmentation`` and
   ``position`` are trivially uniform within an instance.
+
+  With ``segment_eos_token_id`` set, ``inputs_segmentation`` instead numbers the
+  EOS-delimited documents the way OLMo-core's EMo router does
+  (``segment_ids_from_eos``: an EOS token starts the next segment; position 0
+  never does), offset by one so no real token sits in MaxText's padding segment
+  0. ``targets_segmentation`` carries the same ids, or zeros for a filtered
+  instance. The mixers must then be told to ignore the segments
+  (``olmoe3_segments_for_emo_only``), since OLMo-core's attention and KDA see
+  the whole instance.
   """
+
+  def __init__(self, segment_eos_token_id: int = -1):
+    self.segment_eos_token_id = int(segment_eos_token_id)
 
   def map(self, element: Dict[str, Any]) -> Dict[str, Any]:
     """Convert ``tokens`` into ``inputs`` / ``targets`` / segmentation tensors."""
@@ -502,6 +514,12 @@ class ShiftToInputsTargets(grain.transforms.Map):
     L = tokens.shape[0]  # == sequence_length from the index
     instance_mask = bool(element.get("instance_mask", True))
     seg_value = np.int32(1) if instance_mask else np.int32(0)
+    if self.segment_eos_token_id >= 0:
+      starts = (tokens == self.segment_eos_token_id).astype(np.int32)
+      starts[0] = 0
+      segments = 1 + np.cumsum(starts, dtype=np.int32)
+    else:
+      segments = np.ones(L, dtype=np.int32)
 
     # Output rank-2 (batch, seq) tensors of length L (= max_target_length).
     # The TPU splash-attention kernel requires q_seq_len to be divisible by
@@ -519,14 +537,14 @@ class ShiftToInputsTargets(grain.transforms.Map):
     targets[:-1] = tokens[1:]
     targets[-1] = 0  # pad; loss masked below
 
-    targets_seg = np.full(L, seg_value, dtype=np.int32)
+    targets_seg = segments * seg_value
     targets_seg[-1] = 0  # never compute loss on the boundary position
 
     return {
         "inputs": inputs,
         "targets": targets,
         "inputs_position": np.arange(L, dtype=np.int32),
-        "inputs_segmentation": np.ones(L, dtype=np.int32),
+        "inputs_segmentation": segments,
         "targets_segmentation": targets_seg,
     }
 
@@ -539,6 +557,7 @@ def make_olmo_grain_data_loader(
     shard_index: int,
     shard_count: int,
     apply_ngram_filter: bool = True,
+    segment_eos_token_id: int = -1,
     shift_to_inputs_targets: bool = True,
     path_remap: Optional[Dict[str, str]] = None,
     grain_worker_count: int = 0,
@@ -556,6 +575,8 @@ def make_olmo_grain_data_loader(
     shard_index: This host's data-loading rank.
     shard_count: Total data-loading hosts.
     apply_ngram_filter: Add :class:`NgramFilterTransform` (recommended).
+    segment_eos_token_id: With >= 0, number EOS-delimited documents in ``inputs_segmentation`` (see
+      :class:`ShiftToInputsTargets`); -1 keeps one segment per instance.
     shift_to_inputs_targets: Add :class:`ShiftToInputsTargets` so the loader
       yields the ``inputs``/``targets`` shape MaxText's trainer expects.
     path_remap: Pass-through to :class:`OlmoNpyDataSource`.
@@ -602,7 +623,7 @@ def make_olmo_grain_data_loader(
   if apply_ngram_filter:
     ops.append(NgramFilterTransform())
   if shift_to_inputs_targets:
-    ops.append(ShiftToInputsTargets())
+    ops.append(ShiftToInputsTargets(segment_eos_token_id))
   ops.append(grain.transforms.Batch(batch_size=batch_size, drop_remainder=True))
 
   # Grain expects ``shard_options`` on the DataLoader (sharding used to live

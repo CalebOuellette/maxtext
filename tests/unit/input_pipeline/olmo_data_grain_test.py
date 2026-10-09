@@ -287,6 +287,22 @@ class TransformsTest(unittest.TestCase):
     # Last target position masked even when instance is clean.
     np.testing.assert_array_equal(out["targets_segmentation"], np.array([1, 1, 1, 1, 1, 1, 1, 0], dtype=np.int32))
 
+  def test_shift_to_inputs_targets_segments_documents_at_eos(self):
+    """segment_eos_token_id numbers documents as OLMo-core's segment_ids_from_eos does, plus one."""
+    eos = 9
+    arr = np.array([eos, 1, 2, eos, 3, eos, eos, 4], dtype=np.uint32)
+    out = ShiftToInputsTargets(segment_eos_token_id=eos).map(
+        {"tokens": arr, "instance_id": 0, "file_id": 0, "instance_mask": True}
+    )
+    # An EOS starts the next segment; position 0 never does; ids start at 1 (0 is MaxText's padding segment).
+    np.testing.assert_array_equal(out["inputs_segmentation"], np.array([1, 1, 1, 2, 2, 3, 4, 4], dtype=np.int32))
+    np.testing.assert_array_equal(out["targets_segmentation"], np.array([1, 1, 1, 2, 2, 3, 4, 0], dtype=np.int32))
+    dirty = ShiftToInputsTargets(segment_eos_token_id=eos).map(
+        {"tokens": arr, "instance_id": 0, "file_id": 0, "instance_mask": False}
+    )
+    np.testing.assert_array_equal(dirty["inputs_segmentation"], np.array([1, 1, 1, 2, 2, 3, 4, 4], dtype=np.int32))
+    np.testing.assert_array_equal(dirty["targets_segmentation"], np.zeros(8, dtype=np.int32))
+
   def test_shift_to_inputs_targets_dirty_zeros_target_segmentation(self):
     arr = np.arange(8, dtype=np.uint32)
     out = ShiftToInputsTargets().map({"tokens": arr, "instance_id": 0, "file_id": 0, "instance_mask": False})

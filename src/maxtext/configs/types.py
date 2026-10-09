@@ -2212,6 +2212,21 @@ class OlmoGrainDataset(BaseModel):
       description="Replacement prefix used together with olmo_path_remap_from (e.g. /mnt/disks/.../).",
   )
   olmo_apply_ngram_filter: bool = Field(True, description="Mask repetitive instances per OLMo-core's repetition filter.")
+  olmo_segment_eos_token_id: int = Field(
+      -1,
+      description=(
+          "olmo_grain: with >= 0, inputs_segmentation numbers the EOS-delimited documents of each instance as "
+          "OLMo-core's EMo router does (an EOS starts the next segment), offset by one; -1 keeps one segment per instance."
+      ),
+  )
+  olmoe3_segments_for_emo_only: bool = Field(
+      False,
+      description=(
+          "OLMoE3: the attention and KDA mixers see every instance as one segment (no document masking, no state "
+          "resets), as OLMo-core trains without document lengths; only the EMo router's document pools use the "
+          "segment ids. Pair with olmo_segment_eos_token_id."
+      ),
+  )
   olmo_global_indices_path: PathStr = Field(
       "",
       description=(

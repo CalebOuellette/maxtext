@@ -951,6 +951,8 @@ olmo_index_path: '' # JSON from tools/data_generation/build_olmo_npy_index.py
 olmo_path_remap_from: '' # rewrite index paths starting with this prefix...
 olmo_path_remap_to: ''   # ...to this one (e.g. gs://bucket/ -> /mnt/.../ for gcsfuse).
 olmo_apply_ngram_filter: true # mask instances with repetitive n-grams (OLMo-core filter)
+olmo_segment_eos_token_id: -1 # >= 0: number EOS-delimited documents in inputs_segmentation (OLMo-core's EMo segments); -1: one segment per instance
+olmoe3_segments_for_emo_only: false # OLMoE3: mixers ignore the segment ids (whole-instance attention and KDA, as OLMo-core); only EMo uses them
 olmo_global_indices_path: '' # OLMo-core global indices (uint32) to train in its batch order instead of data_shuffle_seed
 
 # Training loop

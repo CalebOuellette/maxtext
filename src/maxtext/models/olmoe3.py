@@ -823,10 +823,15 @@ class OLMoE3DecoderLayer(nnx.Module):
     inputs = checkpoint_name(inputs, "decoder_layer_input")
 
     normed = self.attn_in_norm(inputs)
+    # OLMo-core trains without document lengths: attention and KDA see the whole instance, and only the EMo
+    # router splits it into documents (from EOS). With the flag, the mixers get one segment per instance.
+    mixer_segment_ids = decoder_segment_ids
+    if self.config.olmoe3_segments_for_emo_only and decoder_segment_ids is not None:
+      mixer_segment_ids = jnp.ones_like(decoder_segment_ids)
     if self.is_full_attention_layer:
       mixer_out, kv_cache = self.mixer(
           normed,
-          decoder_segment_ids,
+          mixer_segment_ids,
           decoder_positions,
           deterministic,
           model_mode,
@@ -834,7 +839,7 @@ class OLMoE3DecoderLayer(nnx.Module):
           attention_metadata=attention_metadata,
       )
     else:
-      mixer_out = self.mixer(normed, decoder_segment_ids)
+      mixer_out = self.mixer(normed, mixer_segment_ids)
 
     hidden = inputs + self.attn_out_norm(mixer_out)
     hidden = nn.with_logical_constraint(hidden, self.activation_axis_names)
