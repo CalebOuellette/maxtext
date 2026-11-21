@@ -1334,6 +1334,7 @@ class _LiveMixtureHostLoader:
       processes: bool = False,
       batch_prefetch_depth: Optional[int] = None,
       prefetch_max_in_flight: Optional[int] = None,
+      pack_buffer_size: Optional[int] = None,
   ):
     # Rows of each rank batch this host keeps (None: all). See OLMO_MM_LOADER_WORLD in _make_mm_loader_for_host.
     self._row_slice = row_slice
@@ -1346,6 +1347,7 @@ class _LiveMixtureHostLoader:
         path_remap_from=path_remap_from,
         path_remap_to=path_remap_to,
         global_batch_tokens=global_batch_tokens,
+        pack_buffer_size=pack_buffer_size,
         num_workers=num_workers,
         batch_prefetch_depth=batch_prefetch_depth,
         processes=processes,
@@ -1666,6 +1668,11 @@ def _make_mm_loader_for_host(
             processes=True,
             batch_prefetch_depth=int(os.environ.get("OLMO_MM_PRODUCER_DEPTH", "2")),
             prefetch_max_in_flight=int(os.environ.get("OLMO_MM_PRODUCER_IN_FLIGHT", "4")),
+            # The packer's buffer of prepared examples, each with its decoded image patches at 256K; the GPU
+            # config's 1,536 a rank is sized for one rank per GPU on a 2 TB node. Unset: the config's value.
+            pack_buffer_size=(
+                int(os.environ["OLMO_MM_PRODUCER_PACK_BUFFER"]) if os.environ.get("OLMO_MM_PRODUCER_PACK_BUFFER") else None
+            ),
             seed_offset=0x1F1F1F1F if is_eval else 0,
             initial_batch_step=resumed_step,
             row_slice=[row_slice.start, row_slice.stop] if row_slice is not None else None,
