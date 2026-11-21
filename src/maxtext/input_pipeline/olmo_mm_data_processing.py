@@ -1123,6 +1123,7 @@ def build_olmo_core_mixture_loader(
     num_workers: int = 0,
     batch_prefetch_depth: Optional[int] = None,
     processes: bool = False,
+    prefetch_max_in_flight: Optional[int] = None,
     seed_offset: int = 0,
 ) -> Tuple[Any, dict[str, Any]]:
   """Build a live ``OLMo-core`` ``MixtureDataLoader`` from a serialized experiment ``config.json``."""
@@ -1170,6 +1171,10 @@ def build_olmo_core_mixture_loader(
         max(0, int(batch_prefetch_depth)) if batch_prefetch_depth is not None else default_depth
     )
     in_flight_cap = max(16, int(num_workers) * 4) if seq_len_cfg >= 65536 else max(32, int(num_workers) * 16)
+    if prefetch_max_in_flight is not None:
+      # The cap is per source group, and a prepared 256K example holds its decoded image patches: with fast process
+      # workers the groups' in-flight examples filled a 404 GB host (2026-11-21). The producer sets this small.
+      in_flight_cap = max(1, int(prefetch_max_in_flight))
     dl_dict["prefetch_max_in_flight"] = min(int(dl_dict.get("prefetch_max_in_flight") or in_flight_cap), in_flight_cap)
 
   ds_cfg = MultimodalMixtureConfig.from_dict(ds_dict)
@@ -1328,6 +1333,7 @@ class _LiveMixtureHostLoader:
       row_slice: Optional[slice] = None,
       processes: bool = False,
       batch_prefetch_depth: Optional[int] = None,
+      prefetch_max_in_flight: Optional[int] = None,
   ):
     # Rows of each rank batch this host keeps (None: all). See OLMO_MM_LOADER_WORLD in _make_mm_loader_for_host.
     self._row_slice = row_slice
@@ -1343,6 +1349,7 @@ class _LiveMixtureHostLoader:
         num_workers=num_workers,
         batch_prefetch_depth=batch_prefetch_depth,
         processes=processes,
+        prefetch_max_in_flight=prefetch_max_in_flight,
         seed_offset=seed_offset,
     )
     tm_pad_id = raw_cfg.get("train_module", {}).get("padding_input_token_id")
@@ -1658,6 +1665,7 @@ def _make_mm_loader_for_host(
             num_workers=int(os.environ.get("OLMO_MM_PRODUCER_WORKERS", "48")),
             processes=True,
             batch_prefetch_depth=int(os.environ.get("OLMO_MM_PRODUCER_DEPTH", "2")),
+            prefetch_max_in_flight=int(os.environ.get("OLMO_MM_PRODUCER_IN_FLIGHT", "4")),
             seed_offset=0x1F1F1F1F if is_eval else 0,
             initial_batch_step=resumed_step,
             row_slice=[row_slice.start, row_slice.stop] if row_slice is not None else None,
