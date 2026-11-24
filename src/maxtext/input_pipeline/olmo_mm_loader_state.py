@@ -27,6 +27,13 @@ On resume at step S the newest state with N <= S is loaded and only the S - N ba
 (fewer than ``period``). With no usable state the loader falls back to the full replay, and writes states as it
 goes, so a run started before this existed pays the replay once.
 
+Switches (environment, read by ``store_from_env`` and ``restore_from_env``):
+
+  ``OLMO_MM_LOADER_STATE_PERIOD=0``   no states at all: nothing is saved and a resume replays every batch, the
+                                      behaviour before this module existed.
+  ``OLMO_MM_LOADER_STATE_RESTORE=0``  keep saving states but resume by the full replay (to rule the restore out,
+                                      or to compare the two).
+
 The files are pickles: the loader compares the saved values (sizes, weights, fingerprints, group quotas) with its
 own by equality, and a JSON round trip would turn tuples into lists. They are read only from the run's own
 directory.
@@ -142,12 +149,18 @@ def store_from_env(
   return LoaderStateStore(state_dir, rank=rank, world=world, period=period, keep=keep, log=log)
 
 
+def restore_from_env() -> bool:
+  """False when ``OLMO_MM_LOADER_STATE_RESTORE=0``: resume by the full replay even where states exist."""
+  return (os.environ.get("OLMO_MM_LOADER_STATE_RESTORE", "1") or "1").strip() != "0"
+
+
 class ResumableBatches:
   """Batches of a loader built by ``build()``, positioned at ``start_step`` and saving its state as it goes.
 
   ``build()`` returns a fresh loader with ``__iter__``, ``reshuffle()``, ``state_dict()`` and
   ``load_state_dict()`` (OLMo-core's ``MixtureDataLoader``). ``next()`` returns its batches from number
   ``start_step`` on; ``taken`` is how many batches have been drawn from the loader since batch 0.
+  ``restore=False`` positions the loader by replaying every batch even where the store has a state.
   """
 
   def __init__(
@@ -156,6 +169,7 @@ class ResumableBatches:
       *,
       start_step: int = 0,
       store: Optional[LoaderStateStore] = None,
+      restore: bool = True,
       log: Callable[[str], None] = print,
   ):
     self._store = store
@@ -167,7 +181,7 @@ class ResumableBatches:
     self._iter = None
     start_step = int(start_step)
 
-    found = store.latest_at_or_before(start_step) if (store is not None and start_step > 0) else None
+    found = store.latest_at_or_before(start_step) if (store is not None and restore and start_step > 0) else None
     if found is not None:
       step, state = found
       try:
@@ -191,7 +205,12 @@ class ResumableBatches:
         self._stash = None
         self.taken = 0
     elif start_step > 0:
-      where = f"no saved state at or before it under {store.dir}" if store is not None else "loader states are off"
+      if store is None:
+        where = "loader states are off"
+      elif not restore:
+        where = "OLMO_MM_LOADER_STATE_RESTORE=0"
+      else:
+        where = f"no saved state at or before it under {store.dir}"
       log(f"olmo_mm loader: resuming at step {start_step} by replaying every batch ({where})")
 
     if self._iter is None:

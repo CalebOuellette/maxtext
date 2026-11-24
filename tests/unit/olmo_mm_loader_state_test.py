@@ -169,6 +169,29 @@ class ResumableBatchesTest(unittest.TestCase):
     self.assertEqual(_take(resumed, 18), reference[12:])
     self.assertTrue(any("could not restore" in line for line in self.logs))
 
+  def test_restore_off_replays_every_batch_and_still_saves(self):
+    reference = self._reference(30)
+    _take(ls.ResumableBatches(_FakeLoader, store=self._store(keep=2), log=self.logs.append), 12)
+    self.assertEqual(self._store().steps(), [5, 10])
+    built = []
+
+    def build():
+      built.append(_FakeLoader())
+      return built[-1]
+
+    resumed = ls.ResumableBatches(build, start_step=12, store=self._store(keep=2), restore=False, log=self.logs.append)
+    self.assertIsNone(resumed.restored_from)
+    self.assertEqual(_take(resumed, 18), reference[12:])
+    self.assertEqual(built[-1].built, 30)  # every batch from 0
+    self.assertEqual(self._store().steps(), [25, 30])
+    self.assertTrue(any("OLMO_MM_LOADER_STATE_RESTORE=0" in line for line in self.logs))
+
+  def test_restore_from_env(self):
+    with mock.patch.dict(os.environ, {}, clear=True):
+      self.assertTrue(ls.restore_from_env())
+    with mock.patch.dict(os.environ, {"OLMO_MM_LOADER_STATE_RESTORE": "0"}, clear=True):
+      self.assertFalse(ls.restore_from_env())
+
   def test_without_a_store_it_replays(self):
     reference = self._reference(20)
     resumed = ls.ResumableBatches(_FakeLoader, start_step=7, log=self.logs.append)

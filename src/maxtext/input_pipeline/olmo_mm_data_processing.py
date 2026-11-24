@@ -1377,6 +1377,7 @@ class _LiveMixtureHostLoader:
             if loader_state_checkpoint_dir
             else None
         ),
+        restore=olmo_mm_loader_state.restore_from_env(),
         log=max_logging.log,
     )
     self._loader = self._batches.loader
