@@ -53,6 +53,7 @@ import numpy as np
 from numpy.lib import format as np_format
 
 from maxtext.input_pipeline import multihost_dataloading
+from maxtext.input_pipeline import olmo_mm_loader_state
 from maxtext.input_pipeline.olmo_grain_data_processing import _detect_resumed_step
 from maxtext.utils import max_logging
 
@@ -1305,7 +1306,11 @@ class _PreExportedNpzHostLoader:
 
 
 class _LiveMixtureHostLoader:
-  """Per-host iterable wrapping ``OLMo-core`` ``MixtureDataLoader`` and converting batches on the fly."""
+  """Per-host iterable wrapping ``OLMo-core`` ``MixtureDataLoader`` and converting batches on the fly.
+
+  ``initial_batch_step`` > 0 resumes: the loader is restored from the newest state saved under
+  ``loader_state_checkpoint_dir``'s run (see olmo_mm_loader_state.py) and only the batches after that state are
+  replayed; with no state, every batch from 0 is replayed. Either way it saves states as it goes."""
 
   def __init__(
       self,
@@ -1335,25 +1340,47 @@ class _LiveMixtureHostLoader:
       batch_prefetch_depth: Optional[int] = None,
       prefetch_max_in_flight: Optional[int] = None,
       pack_buffer_size: Optional[int] = None,
+      loader_state_checkpoint_dir: str = "",
   ):
     # Rows of each rank batch this host keeps (None: all). See OLMO_MM_LOADER_WORLD in _make_mm_loader_for_host.
     self._row_slice = row_slice
     global_batch_tokens = int(per_host_batch) * int(shard_count) * int(max_target_length)
-    self._loader, raw_cfg = build_olmo_core_mixture_loader(
-        config_path,
-        work_dir=work_dir,
-        shard_index=shard_index,
-        shard_count=shard_count,
-        path_remap_from=path_remap_from,
-        path_remap_to=path_remap_to,
-        global_batch_tokens=global_batch_tokens,
-        pack_buffer_size=pack_buffer_size,
-        num_workers=num_workers,
-        batch_prefetch_depth=batch_prefetch_depth,
-        processes=processes,
-        prefetch_max_in_flight=prefetch_max_in_flight,
-        seed_offset=seed_offset,
+    raw_cfgs = []
+
+    def build():
+      loader, raw = build_olmo_core_mixture_loader(
+          config_path,
+          work_dir=work_dir,
+          shard_index=shard_index,
+          shard_count=shard_count,
+          path_remap_from=path_remap_from,
+          path_remap_to=path_remap_to,
+          global_batch_tokens=global_batch_tokens,
+          pack_buffer_size=pack_buffer_size,
+          num_workers=num_workers,
+          batch_prefetch_depth=batch_prefetch_depth,
+          processes=processes,
+          prefetch_max_in_flight=prefetch_max_in_flight,
+          seed_offset=seed_offset,
+      )
+      raw_cfgs.append(raw)
+      return loader
+
+    # Positioned at initial_batch_step: from a saved loader state when the run has one, else by replaying.
+    self._batches = olmo_mm_loader_state.ResumableBatches(
+        build,
+        start_step=int(initial_batch_step),
+        store=(
+            olmo_mm_loader_state.store_from_env(
+                checkpoint_dir=loader_state_checkpoint_dir, rank=shard_index, world=shard_count
+            )
+            if loader_state_checkpoint_dir
+            else None
+        ),
+        restore=olmo_mm_loader_state.restore_from_env(),
     )
+    self._loader = self._batches.loader
+    raw_cfg = raw_cfgs[-1]
     tm_pad_id = raw_cfg.get("train_module", {}).get("padding_input_token_id")
     if int(padding_input_token_id) >= 0:
       self._padding_input_token_id = int(padding_input_token_id)
@@ -1372,25 +1399,11 @@ class _LiveMixtureHostLoader:
     self._reset_positions = bool(reset_positions_on_segment)
     self._use_loss_weights = bool(use_loss_weights)
 
-    self._iter = iter(self._loader)
-    for _ in range(int(initial_batch_step)):
-      try:
-        next(self._iter)
-      except StopIteration:
-        self._loader.reshuffle()
-        self._iter = iter(self._loader)
-        next(self._iter)
-
   def __iter__(self):
     return self
 
   def __next__(self) -> dict[str, np.ndarray]:
-    try:
-      raw_batch = next(self._iter)
-    except StopIteration:
-      self._loader.reshuffle()
-      self._iter = iter(self._loader)
-      raw_batch = next(self._iter)
+    raw_batch = next(self._batches)
     out = olmo_core_batch_to_maxtext_batch(
         raw_batch,
         max_target_length=self._max_target_length,
@@ -1625,8 +1638,14 @@ def _make_mm_loader_for_host(
       f"per_host_batch={per_host_batch} seq={config.max_target_length} crops={n_crops} pooled={n_pooled} "
       f"resumed_step={resumed_step}"
   )
+  # Where the loader's saved positions live (olmo_mm_loader_state.py); empty turns them off (eval, no checkpoints).
+  loader_state_checkpoint_dir = ""
+  if not is_eval and getattr(config, "enable_checkpointing", False):
+    loader_state_checkpoint_dir = getattr(config, "checkpoint_dir", "") or ""
+
   def build_live(rank):
     return _LiveMixtureHostLoader(
+      loader_state_checkpoint_dir=loader_state_checkpoint_dir,
       row_slice=row_slice,
       config_path=cfg_path,
       work_dir=work_dir,
@@ -1689,6 +1708,7 @@ def _make_mm_loader_for_host(
             ),
             seed_offset=0x1F1F1F1F if is_eval else 0,
             initial_batch_step=resumed_step,
+            loader_state_checkpoint_dir=loader_state_checkpoint_dir,
             row_slice=[row_slice.start, row_slice.stop] if row_slice is not None else None,
         ),
     }
