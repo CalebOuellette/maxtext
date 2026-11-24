@@ -1372,13 +1372,12 @@ class _LiveMixtureHostLoader:
         start_step=int(initial_batch_step),
         store=(
             olmo_mm_loader_state.store_from_env(
-                checkpoint_dir=loader_state_checkpoint_dir, rank=shard_index, world=shard_count, log=max_logging.log
+                checkpoint_dir=loader_state_checkpoint_dir, rank=shard_index, world=shard_count
             )
             if loader_state_checkpoint_dir
             else None
         ),
         restore=olmo_mm_loader_state.restore_from_env(),
-        log=max_logging.log,
     )
     self._loader = self._batches.loader
     raw_cfg = raw_cfgs[-1]

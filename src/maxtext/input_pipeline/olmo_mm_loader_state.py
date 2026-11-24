@@ -49,6 +49,12 @@ from etils import epath
 _STEP_FILE = re.compile(r"^step_(\d+)\.pkl$")
 
 
+def print_log(msg: str) -> None:
+  """Standard output, flushed. Not absl: the loader usually runs in a producer process (olmo_mm_producer.py),
+  where absl's INFO messages are not shown, and whether a resume restored or replayed has to be in the log."""
+  print(msg, flush=True)
+
+
 class LoaderStateStore:
   """States of one loader rank under ``state_dir`` (local or ``gs://``)."""
 
@@ -60,7 +66,7 @@ class LoaderStateStore:
       world: int,
       period: int = 25,
       keep: int = 40,
-      log: Callable[[str], None] = print,
+      log: Callable[[str], None] = print_log,
   ):
     if period < 1:
       raise ValueError(f"period must be at least 1, got {period}")
@@ -127,7 +133,7 @@ def store_from_env(
     checkpoint_dir: str,
     rank: int,
     world: int,
-    log: Callable[[str], None] = print,
+    log: Callable[[str], None] = print_log,
 ) -> Optional[LoaderStateStore]:
   """The store for a training loader, or None when states are off.
 
@@ -170,7 +176,7 @@ class ResumableBatches:
       start_step: int = 0,
       store: Optional[LoaderStateStore] = None,
       restore: bool = True,
-      log: Callable[[str], None] = print,
+      log: Callable[[str], None] = print_log,
   ):
     self._store = store
     self._log = log
