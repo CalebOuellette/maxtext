@@ -274,7 +274,7 @@ In progress / not yet verified:
 
 1. Full Tiny real-data `8K Bridge` (`500` steps, currently past step `360/500` tracking the GPU W&B CE curve closely) -> `8K Joint` -> `256K` multi-step curve comparison against GPU reference runs.
 2. Live `MixtureDataLoader` mode (`olmo_mm_config_path`) on TPU hosts, including its throughput at `8K` and `256K`, and `olmo_grain` chunk-edge masking on hardware.
-3. Resume in live mode: the loader replays earlier batches after a restart unless loader state checkpointing is enabled/saved, which is slow late in a long run.
+3. Resume in live mode: the loader saves its position every `OLMO_MM_LOADER_STATE_PERIOD` batches (default `25`) under `<run dir>/olmo_mm_loader_state` (`olmo_mm_loader_state.py`) and a restart restores the newest one at or before the resumed step, replaying only the batches after it. Tested on CPU against a full replay with OLMo-core's grouped packed loader; not yet run on TPU hosts or against `gs://`. A run with no saved state still replays every batch once (about `2` s a batch at `256K`), saving states as it goes.
 4. The full `bridge_init` -> `Bridge` -> `Joint` -> `256K` path at Hero (`Small`) scale once Hero vision-alignment LRs are finalized.
 
 ---
